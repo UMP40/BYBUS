@@ -31,7 +31,7 @@ It does not require a catalog entry or a rebuilt launcher for every same-family 
 - `gamefs`: `GameStorage` abstraction for container data access.
 - `update`: GitHub Releases discovery, hash checking, `.7z` extraction, and patch cache manifest generation.
 - `TranslationRepository`: download/cache ownership and retention; `TranslationJsonPairer`: pure identity and field matching; `TranslationIndexStore`: generation validation and activation.
-- `DeviceCompatibility`: Android 8+/arm64/page-size/low-RAM/background-policy inspection and verified OEM settings fallback.
+- `DeviceCompatibility`: the native profile's Android 16 / ARM64 / 4 KiB boundary, process architecture, low-RAM/background-policy inspection and verified OEM settings fallback.
 - `PersistentDiagnosticLog` / `DebugLogExporter`: per-process bounded logs, uncaught exception capture, redaction, exit reasons, and Issue ZIP generation.
 
 ## Startup latency and handoff (2026-10-12)
@@ -365,15 +365,49 @@ because a formatter may already have returned Chinese before the setter hook
 runs; relying only on a setter-time replacement would leave the first such screen
 without Chinese-only glyphs.
 
-Translation provenance is retained by exact UTF-8 output content rather than by
-the raw IL2CPP object address alone. Limbus can copy a returned string into a new
-managed object before assigning it to TMP, and address-only tagging then loses the evidence needed
-to select the uniform Chinese primary face. Exact content tracking survives that
-copy while still avoiding a blanket font replacement for native Japanese text.
-Known, reviewed upstream terminology errors are normalized while the index is
-compiled, and a very small built-in term table covers reviewed Japanese condition
-fragments that otherwise degrade into half-Japanese output after shorter terms are
-substituted.
+Translation identity and font evidence are separate. Weak IL2CPP GC handles prove
+which live string objects were produced by the translator; a raw address or a
+previously seen spelling cannot suppress a different resource's translation.
+Unchanged source/target pairs participate in conflict detection. Sparse context
+entries also cover source/target chains, so a Chinese output such as 防御 cannot
+silence the original Japanese 防御 in another resource. Unscoped copies use the
+immutable release catalogue to avoid translating a known Chinese result again.
+Bounded recent output content is only additional font evidence, never a global
+translation veto. Live object evidence is not evicted when a cache fills; if its
+capacity cannot be reclaimed, new substitutions keep the original text.
+
+Saved component styles belong to a weak managed reference and a Unity instance
+ID. Incremental collection removes reclaimed or destroyed components, releases
+their retained font/material handles, and bounds the state table. A live entry is
+never evicted while its style still needs restoration. Unity 6 GC handles are
+opaque pointer-sized values, not the older 32-bit indices; retention, weak lookup
+and release must preserve every bit. A startup round-trip validates strong and
+weak references together before any text component can be changed.
+TMP uses the bundled Sarasa Bold file. Legacy UI.Text keeps the previously
+verified dynamic Android sans-serif fallback: Font(string path) did not produce
+a dynamic font on the current Android player, so it must not replace a working
+fallback. Matching the legacy font to the bundled face remains unverified.
+Font creation/registration failures leave the original assignment intact.
+Creation is confined to Unity's IL2CPP initialization thread. Resource workers
+defer substitution until the shared font is ready; they cannot latch a failed
+font initialization by invoking Unity asset APIs on a background thread.
+The legacy creation API is documented in Unity's
+[TextRendering bindings](https://github.com/Unity-Technologies/UnityCsReference/blob/6000.3/Modules/TextRendering/TextRendering.bindings.cs).
+
+The pending Google identity and billing request codes are saved across bridge
+Activity recreation before a child UI is opened. Restoring a bridge waits for
+the existing result instead of opening another UI.
+
+Diagnostic exports keep a private, atomic pending-file descriptor. The file
+picker result is queued behind startup recovery, and successful save or explicit
+cancellation removes the descriptor and archive. Invalid or missing descriptors
+report an error instead of silently producing an empty export. Only an owned
+diagnostic ZIP may be recovered; no arbitrary source path is accepted.
+
+The launcher may install on API 26+, but the current game compatibility profiles
+only authorize Android 16 (API 36), a 64-bit ARM process and 4 KiB memory pages.
+The device report and launch error state must describe that same boundary;
+unknown game structures continue to fail closed.
 
 ## Notes
 
