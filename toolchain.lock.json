@@ -1,0 +1,68 @@
+{
+  "schema": 1,
+  "project": "LimbusZhLauncher",
+  "source": {
+    "repository": "https://github.com/BBBEANNN/limbusZhCN",
+    "commit": "997dde5e0a1fadec9f18ded852d7f285ea613b66",
+    "archive_sha256": "14e1c8662aefc28603465e6661dfdaf60042fa43fd791c8e24a8c0713a44b56b",
+    "provider_fix_commit": "964cb68a62971a7f73e8357cc40ad00d91cdc762"
+  },
+  "reused": [
+    {
+      "name": "JDK",
+      "version": "17.0.12",
+      "path": "C:/Program Files/Java/jdk-17",
+      "check": "java -version"
+    },
+    {
+      "name": "Gradle",
+      "version": "8.10.2",
+      "path": "${GRADLE_USER_HOME}/wrapper/dists/gradle-8.10.2-bin",
+      "check": "Gradle build launched"
+    },
+    {
+      "name": "Android platform-tools",
+      "version": "34.0.5",
+      "path": "D:/CodexData/cache/android-sdk/platform-tools",
+      "sdk_junction": "D:/CodexData/cache/android-sdk/platform-tools",
+      "check": "adb 34.0.5; paired wireless device, release install and native fixture execution verified"
+    }
+  ],
+  "installed": [
+    {
+      "name": "Android SDK Platform 35",
+      "version": "35 revision 2",
+      "path": "D:/CodexData/cache/android-sdk/platforms/android-35",
+      "url": "https://dl.google.com/android/repository/platform-35_r02.zip",
+      "archive_sha1": "0bb560a90a7a2cbd0dd8348224d518b638fe7949",
+      "check": "Official repository checksum and source.properties matched; android.jar loaded by AGP"
+    },
+    {
+      "name": "Android SDK Build-Tools",
+      "version": "35.0.0",
+      "path": "D:/CodexData/cache/android-sdk/build-tools/35.0.0",
+      "url": "https://dl.google.com/android/repository/build-tools_r35_windows.zip",
+      "archive_sha1": "af059bb67cf7786f45ee0db85e2d24985df1b4b6",
+      "check": "Official repository checksum matched; aapt2 version 2.19-11948202 executed"
+    },
+    {
+      "name": "Android NDK",
+      "version": "30.0.14904198-beta1",
+      "path": "D:/CodexData/cache/android-sdk/ndk/30.0.14904198",
+      "url": "https://dl.google.com/android/repository/android-ndk-r30-beta1-windows.zip",
+      "archive_sha1": "ec410335aac74d182b369a62c18079187b191149",
+      "check": "Official repository checksum matched; clang 21.0.0 executed; HOST_OS/HOST_ARCH set only for build subprocess"
+    }
+  ],
+  "build_plugins": {
+    "agp": "8.8.0",
+    "kotlin": "2.0.0"
+  },
+  "storage": {
+    "gradle_cache": "D:/CodexData/cache/gradle",
+    "temporary": "D:/CodexData/temp/limbus-build",
+    "output": "D:/CodexData/outputs/LimbusZhLauncher"
+  },
+  "verification_report": "D:/CodexData/outputs/LimbusZhLauncher/验证结果.json",
+  "device_verification": "vivo X100 Ultra / Android16 / 4KiB / Limbus 471: Google login, Chinese text, signed Release upgrade preserving resources and login; see docs/architecture-hardening.md"
+}
