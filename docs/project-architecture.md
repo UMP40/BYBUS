@@ -383,16 +383,35 @@ never evicted while its style still needs restoration. Unity 6 GC handles are
 opaque pointer-sized values, not the older 32-bit indices; retention, weak lookup
 and release must preserve every bit. A startup round-trip validates strong and
 weak references together before any text component can be changed.
-TMP uses the bundled Sarasa Bold file. Legacy UI.Text keeps the previously
-verified dynamic Android sans-serif fallback: Font(string path) did not produce
-a dynamic font on the current Android player, so it must not replace a working
-fallback. Matching the legacy font to the bundled face remains unverified.
+TMP uses the bundled Sarasa Bold file. Legacy UI.Text prefers that same file
+through Unity's Font path constructor, with pointer-sized GC retention and
+checks for a live dynamic Font and Chinese glyph coverage before assignment.
+The previous failed attempt ran before the GC-handle ABI correction; its null
+result did not distinguish failed retention from failed font creation. A checked
+creation failure keeps the working Android sans-serif path, using bold while
+preserving italics and restoring the original style on component reuse. Loading
+the bundled legacy face on the user's current device remains unverified.
 Font creation/registration failures leave the original assignment intact.
 Creation is confined to Unity's IL2CPP initialization thread. Resource workers
 defer substitution until the shared font is ready; they cannot latch a failed
 font initialization by invoking Unity asset APIs on a background thread.
 The legacy creation API is documented in Unity's
 [TextRendering bindings](https://github.com/Unity-Technologies/UnityCsReference/blob/6000.3/Modules/TextRendering/TextRendering.bindings.cs).
+
+Formatted font provenance recognizes bounded decimal storage quantities with
+explicit byte units (B, KB/MB/GB/TB, KiB/MiB/GiB/TiB, optionally /s), only within
+a complete released template. The same rule covers sibling fragments; bare
+quantities are not granted translation identity. Newline-separated combinations
+must consist entirely of complete known paragraphs, with at most 16 paragraphs
+and bounded result caching. Arbitrary prose substrings, unknown names and
+font/sprite/noparse tag generalization remain disallowed.
+
+Converted TMP materials belong to component style records through shared leases.
+A weak lookup reuses live conversions; TMP's AddFallbackMaterialReference and
+ReleaseFallbackMaterial are balanced when the last component releases a lease.
+Live component limits bound retained materials, replacing the old cumulative
+128-preset cutoff that discarded new styles. Material-manager conversion still
+preserves the target atlas and its metrics and refreshes changed source presets.
 
 The pending Google identity and billing request codes are saved across bridge
 Activity recreation before a child UI is opened. Restoring a bridge waits for
