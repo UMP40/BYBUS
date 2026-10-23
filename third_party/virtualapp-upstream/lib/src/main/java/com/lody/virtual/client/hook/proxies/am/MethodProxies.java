@@ -49,6 +49,7 @@ import com.lody.virtual.client.env.Constants;
 import com.lody.virtual.client.env.SpecialComponentList;
 import com.lody.virtual.client.env.VirtualRuntime;
 import com.lody.virtual.client.hook.base.MethodProxy;
+import com.lody.virtual.client.hook.delegate.AppInstrumentation;
 import com.lody.virtual.client.hook.delegate.TaskDescriptionDelegate;
 import com.lody.virtual.client.hook.providers.DocumentHook;
 import com.lody.virtual.client.hook.providers.ProviderHook;
@@ -1025,11 +1026,14 @@ class MethodProxies {
         private boolean isMicrogSignInActivity(Intent intent, ActivityInfo activityInfo) {
             ComponentName component = intent == null ? null : intent.getComponent();
             String className = component != null ? component.getClassName() : (activityInfo == null ? null : activityInfo.name);
+            // LoginActivity returns to the client-local AuthSignInActivity, which has no VAMS
+            // record. Keep both ends on the system result chain, including real cancellation.
             return "com.google.android.gms".equals(getAppPkg())
                     && activityInfo != null
                     && "com.google.android.gms".equals(activityInfo.packageName)
                     && className != null
-                    && className.startsWith("org.microg.gms.auth.signin.");
+                    && (className.startsWith("org.microg.gms.auth.signin.")
+                    || "org.microg.gms.auth.login.LoginActivity".equals(className));
         }
 
         private void logLimbusCredentialNativeMappings() {
@@ -1192,6 +1196,10 @@ class MethodProxies {
         @Override
         public Object call(Object who, Method method, Object... args) throws Throwable {
             IBinder token = (IBinder) args[0];
+            ComponentName caller = AppInstrumentation.getVirtualCallingActivity(token);
+            if (caller != null) {
+                return caller.getPackageName();
+            }
             if (LIMBUS_PACKAGE.equals(getAppPkg()) && HCallbackStub.isClientLocalActivityToken(token)) {
                 Log.i("LimbusVA", "getCallingPackage client-local token=" + token
                         + " -> " + LIMBUS_PACKAGE + "/" + LIMBUS_UNITY_ACTIVITY);
@@ -1876,17 +1884,13 @@ class MethodProxies {
         @Override
         public Object call(Object who, Method method, Object... args) throws Throwable {
             IBinder token = (IBinder) args[0];
+            ComponentName virtualCaller = AppInstrumentation.getVirtualCallingActivity(token);
+            if (virtualCaller != null) {
+                return virtualCaller;
+            }
             if (LIMBUS_PACKAGE.equals(getAppPkg()) && HCallbackStub.isClientLocalActivityToken(token)) {
                 ComponentName caller = new ComponentName(LIMBUS_PACKAGE, LIMBUS_UNITY_ACTIVITY);
                 Log.i("LimbusVA", "getCallingActivity client-local token=" + token
-                        + " -> " + caller.flattenToString());
-                return caller;
-            }
-            if ("com.google.android.gms".equals(getAppPkg()) && HCallbackStub.isClientLocalActivityToken(token)) {
-                ComponentName caller = new ComponentName(
-                        "com.google.android.gms",
-                        "org.microg.gms.auth.signin.AssistedSignInActivity");
-                Log.i("LimbusVA", "getCallingActivity microG client-local token=" + token
                         + " -> " + caller.flattenToString());
                 return caller;
             }
@@ -2138,6 +2142,12 @@ class MethodProxies {
             int intentReceiverIndex = indexOfFirst(args, IIntentReceiver.class);
             com.lody.virtual.helper.compat.ReceiverRegistrationCompat
                     .clearRequiredPermission(method.getParameterTypes(), args);
+            android.content.pm.ApplicationInfo appInfo = VClient.get().getCurrentApplicationInfo();
+            if (appInfo != null) {
+                com.lody.virtual.helper.compat.ReceiverRegistrationCompat.applyLegacyMicrogExportFlag(
+                        Build.VERSION.SDK_INT, getAppPkg(), appInfo.targetSdkVersion,
+                        method.getParameterTypes(), args);
+            }
             int filterIndex = intentFilterIndex >= 0 ? intentFilterIndex : IDX_IntentFilter;
             IntentFilter filter = (IntentFilter) args[filterIndex];
             if (filter == null) {

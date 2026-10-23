@@ -30,11 +30,15 @@ import com.lody.virtual.client.core.VirtualCore;
 import com.lody.virtual.client.fixer.ActivityFixer;
 import com.lody.virtual.client.fixer.ContextFixer;
 import com.lody.virtual.client.hook.proxies.am.HCallbackStub;
+import com.lody.virtual.client.hook.base.MethodInvocationStub;
+import com.lody.virtual.client.hook.proxies.am.ActivityManagerStub;
+import com.lody.virtual.client.hook.proxies.am.ActivityTaskManagerStub;
 import com.lody.virtual.client.ipc.VActivityManager;
 import com.lody.virtual.client.stub.StubManifest;
 import com.lody.virtual.client.interfaces.IInjector;
 import com.lody.virtual.helper.compat.ActivityManagerCompat;
 import com.lody.virtual.helper.compat.BundleCompat;
+import com.lody.virtual.helper.compat.LimbusAuthenticationCompat;
 import com.lody.virtual.os.VUserHandle;
 import com.lody.virtual.remote.ClientConfig;
 import com.lody.virtual.remote.StubActivityRecord;
@@ -45,6 +49,7 @@ import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.util.WeakHashMap;
+import java.util.concurrent.ConcurrentHashMap;
 
 import mirror.android.app.ActivityThread;
 import mirror.android.app.LoadedApk;
@@ -71,6 +76,8 @@ public final class AppInstrumentation extends InstrumentationDelegate implements
     private static Object sActivityClientControllerBase;
     private static Object sActivityClientControllerProxy;
     private static boolean sOplusActivityManagerFallbackAttempted;
+    private static final ConcurrentHashMap<IBinder, ComponentName> VIRTUAL_CALLING_ACTIVITIES =
+            new ConcurrentHashMap<>();
 
     private static AppInstrumentation gDefault;
     private final WeakHashMap<Activity, StubActivityRecord> pendingStubRecords = new WeakHashMap<>();
@@ -426,33 +433,86 @@ public final class AppInstrumentation extends InstrumentationDelegate implements
     }
 
     private void restoreVirtualCallingIdentity(Activity activity, ActivityInfo info) {
-        if (info == null || info.packageName == null || info.name == null) {
+        if (info == null || !GMS_PACKAGE.equals(info.packageName)) {
+            return;
+        }
+        IBinder token = mirror.android.app.Activity.mToken.get(activity);
+        if (token == null) {
             return;
         }
         ComponentName callingActivity = null;
-        String callingPackage = null;
-        if (GMS_PACKAGE.equals(info.packageName)
-                && MICROG_AUTH_SIGN_IN_ACTIVITY.equals(info.name)) {
-            installActivityClientCallerProxyIfNeeded();
-            callingPackage = GMS_PACKAGE;
-            callingActivity = new ComponentName(
-                    GMS_PACKAGE,
-                    MICROG_ASSISTED_SIGN_IN_ACTIVITY);
+        if (MICROG_AUTH_SIGN_IN_ACTIVITY.equals(info.name)
+                && HCallbackStub.isClientLocalActivityToken(token)) {
+            callingActivity = new ComponentName(GMS_PACKAGE, MICROG_ASSISTED_SIGN_IN_ACTIVITY);
+        } else if (MICROG_ASSISTED_SIGN_IN_ACTIVITY.equals(info.name)) {
+            ComponentName physicalCaller = getPhysicalCallingActivity(token);
+            Intent intent = activity.getIntent();
+            if (intent != null && LimbusAuthenticationCompat.shouldRestoreGoogleIdentityCaller(
+                    info.packageName, info.name, intent.getAction(),
+                    intent.getStringExtra("client_package_name"), VirtualCore.get().getHostPkg(),
+                    physicalCaller == null ? null : physicalCaller.getPackageName(),
+                    physicalCaller == null ? null : physicalCaller.getClassName())) {
+                callingActivity = new ComponentName(
+                        LIMBUS_PACKAGE, "androidx.credentials.playservices.HiddenActivity");
+            }
         }
-        if (callingPackage == null || callingActivity == null) {
+        if (callingActivity == null) {
             return;
+        }
+        VIRTUAL_CALLING_ACTIVITIES.put(token, callingActivity);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            installActivityClientCallerProxyIfNeeded();
         }
         try {
             if (mirror.android.app.Activity.mCallingPackage != null) {
-                mirror.android.app.Activity.mCallingPackage.set(activity, callingPackage);
+                mirror.android.app.Activity.mCallingPackage.set(activity, callingActivity.getPackageName());
             }
             if (mirror.android.app.Activity.mCallingActivity != null) {
                 mirror.android.app.Activity.mCallingActivity.set(activity, callingActivity);
             }
+            Log.i("LimbusVA", "Restored virtual calling identity activity=" + info.name
+                    + " caller=" + callingActivity.flattenToString());
         } catch (Throwable error) {
             Log.w("LimbusVA", "Unable to restore virtual calling identity activity="
                     + info.packageName + "/" + info.name, error);
         }
+    }
+
+    /** Returns only identities registered for a validated sign-in Activity token. */
+    public static ComponentName getVirtualCallingActivity(IBinder token) {
+        return token == null ? null : VIRTUAL_CALLING_ACTIVITIES.get(token);
+    }
+
+    private ComponentName getPhysicalCallingActivity(IBinder token) {
+        try {
+            Object service;
+            Class<?> serviceInterface;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                serviceInterface = Class.forName("android.app.IActivityClientController");
+                service = sActivityClientControllerBase;
+                if (service == null) {
+                    Method getController = Class.forName("android.app.ActivityClient")
+                            .getDeclaredMethod("getActivityClientController");
+                    getController.setAccessible(true);
+                    service = getController.invoke(null);
+                }
+            } else {
+                InvocationStubManager manager = InvocationStubManager.getInstance();
+                MethodInvocationStub<?> stub = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+                        ? manager.getInvocationStub(ActivityTaskManagerStub.class)
+                        : manager.getInvocationStub(ActivityManagerStub.class);
+                service = stub == null ? null : stub.getBaseInterface();
+                serviceInterface = Class.forName(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+                        ? "android.app.IActivityTaskManager" : "android.app.IActivityManager");
+            }
+            if (service != null) {
+                return (ComponentName) serviceInterface.getMethod("getCallingActivity", IBinder.class)
+                        .invoke(service, token);
+            }
+        } catch (Throwable error) {
+            Log.w("LimbusVA", "Unable to verify physical Google Identity caller", error);
+        }
+        return null;
     }
 
     private static synchronized void installActivityClientCallerProxyIfNeeded() {
@@ -473,16 +533,15 @@ public final class AppInstrumentation extends InstrumentationDelegate implements
             sActivityClientControllerBase = base;
             InvocationHandler handler = (proxy, method, args) -> {
                 String name = method.getName();
-                if (args != null && args.length > 0 && args[0] instanceof IBinder
-                        && HCallbackStub.isClientLocalActivityToken((IBinder) args[0])) {
-                    if ("getCallingPackage".equals(name)) {
-                        return GMS_PACKAGE;
-                    }
-                    if ("getCallingActivity".equals(name)) {
-                        ComponentName caller = new ComponentName(
-                                GMS_PACKAGE,
-                                MICROG_ASSISTED_SIGN_IN_ACTIVITY);
-                        return caller;
+                if (args != null && args.length > 0 && args[0] instanceof IBinder) {
+                    ComponentName caller = getVirtualCallingActivity((IBinder) args[0]);
+                    if (caller != null) {
+                        if ("getCallingPackage".equals(name)) {
+                            return caller.getPackageName();
+                        }
+                        if ("getCallingActivity".equals(name)) {
+                            return caller;
+                        }
                     }
                 }
                 return method.invoke(sActivityClientControllerBase, args);
@@ -615,7 +674,14 @@ public final class AppInstrumentation extends InstrumentationDelegate implements
 
     @Override
     public void callActivityOnDestroy(Activity activity) {
-        super.callActivityOnDestroy(activity);
+        try {
+            super.callActivityOnDestroy(activity);
+        } finally {
+            IBinder token = mirror.android.app.Activity.mToken.get(activity);
+            if (token != null) {
+                VIRTUAL_CALLING_ACTIVITIES.remove(token);
+            }
+        }
     }
 
     @Override

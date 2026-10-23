@@ -63,6 +63,22 @@ public final class LimbusAuthenticationCompat {
     }
 
     /**
+     * 仅为经本宿主 PendingIntent 桥接的 Limbus Google Identity 页面恢复虚拟调用方。
+     * 系统调用方必须来自未代理的 Activity 服务，不能相信 Intent 自报的来源身份。
+     */
+    public static boolean shouldRestoreGoogleIdentityCaller(
+            String packageName, String activityName, String action, String clientPackageName,
+            String hostPackageName, String callingPackageName, String callingActivityName) {
+        return GMS_PACKAGE.equals(packageName)
+                && "org.microg.gms.auth.signin.AssistedSignInActivity".equals(activityName)
+                && "com.google.android.gms.auth.api.credentials.ASSISTED_SIGNIN".equals(action)
+                && LIMBUS_PACKAGE.equals(clientPackageName)
+                && hostPackageName != null
+                && hostPackageName.equals(callingPackageName)
+                && "com.lody.virtual.client.stub.ShadowPendingActivity".equals(callingActivityName);
+    }
+
+    /**
      * 把受信任的 Firebase Auth 浏览器回调映射到游戏内目标 Activity。
      *
      * @param scheme 回调 URI 的 scheme
