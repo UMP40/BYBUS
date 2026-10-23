@@ -1,5 +1,6 @@
 #include "LimbusTranslationRuntime.h"
 #include "LimbusCodeIntegrityCompat.h"
+#include "LimbusLanguageGetterPatch.h"
 #include "LimbusUiLabels.h"
 #include "LimbusTextProvenance.h"
 #include "LimbusFontProof.h"
@@ -193,7 +194,6 @@ typedef void (*tmp_set_material_fn)(void *, void *, const void *);
 typedef void (*tmp_set_text_fn)(void *, void *, const void *);
 typedef void (*tmp_set_text_string_fn)(void *, void *, bool, const void *);
 typedef void (*tmp_parse_input_fn)(void *, const void *);
-typedef int32_t (*get_language_fn)(void *, const void *);
 typedef void *(*class_get_parent_fn)(void *);
 typedef const void *(*class_get_fields_fn)(void *, void **);
 typedef const char *(*field_get_name_fn)(const void *);
@@ -321,8 +321,6 @@ const void *g_material_get_color_info = nullptr;
 const void *g_material_set_color_info = nullptr;
 il2cpp_init_fn g_original_il2cpp_init = nullptr;
 dlsym_fn g_original_unity_dlsym = nullptr;
-get_language_fn g_original_get_language = nullptr;
-get_language_fn g_original_global_get_language = nullptr;
 class_get_parent_fn g_class_get_parent = nullptr;
 class_get_fields_fn g_class_get_fields = nullptr;
 field_get_name_fn g_field_get_name = nullptr;
@@ -333,7 +331,6 @@ typedef char *(*type_get_name_owned_fn)(const void *);
 typedef void (*il2cpp_free_owned_fn)(void *);
 type_get_name_owned_fn g_type_get_name = nullptr;
 il2cpp_free_owned_fn g_il2cpp_free = nullptr;
-std::atomic<uint32_t> g_language_hook_hits{0};
 std::atomic<uint64_t> g_acquisition_hits{0};
 std::atomic<uint64_t> g_nested_list_hits{0};
 std::atomic<uint64_t> g_tmp_primary_font_switches{0};
@@ -2580,22 +2577,152 @@ void replacement_tmp_set_text_string(void *instance, void *managed_text, bool sy
     observe_popup_font(instance, replacement, false);
 }
 
-int32_t replacement_get_language(void *instance, const void *method) {
-    uint32_t hits = g_language_hook_hits.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (hits <= 5 || hits % 5000 == 0) {
-        LT_LOGI("Japanese language getter hit=%u source=LocalGameOptionData instance=%p method=%p",
-                hits, instance, method);
-    }
-    return 2;  // LOCALIZE_LANGUAGE.JP
+int mapping_protection(void *address);
+
+struct CodeWriteWindow {
+    uintptr_t begin = 0;
+    uintptr_t end = 0;
+    uintptr_t page_begin = 0;
+    size_t page_size = 0;
+    int protection = 0;
+};
+
+bool open_code_write(void *target, size_t width, CodeWriteWindow *window) {
+    if (target == nullptr || window == nullptr || width == 0 || width > 20 || (width & 3u) != 0)
+        return false;
+    const long system_page_size = sysconf(_SC_PAGESIZE);
+    if (system_page_size <= 0 ||
+        (system_page_size & (system_page_size - 1)) != 0) return false;
+    window->begin = reinterpret_cast<uintptr_t>(target);
+    window->end = window->begin + width;
+    const uintptr_t page_mask = static_cast<uintptr_t>(system_page_size) - 1;
+    // Keep the write and its protection change inside the target's own page.
+    if ((window->begin & page_mask) + width > static_cast<uintptr_t>(system_page_size))
+        return false;
+    window->page_begin = window->begin & ~page_mask;
+    const uintptr_t page_end = (window->end + page_mask) & ~page_mask;
+    window->page_size = page_end - window->page_begin;
+    window->protection = mapping_protection(target);
+    if ((window->protection & PROT_EXEC) == 0) return false;
+    return mprotect(reinterpret_cast<void *>(window->page_begin), window->page_size,
+                    window->protection | PROT_WRITE) == 0;
 }
 
-int32_t replacement_global_get_language(void *instance, const void *method) {
-    uint32_t hits = g_language_hook_hits.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (hits <= 5 || hits % 5000 == 0) {
-        LT_LOGI("Japanese language getter hit=%u source=GlobalGameManager.Lang instance=%p method=%p",
-                hits, instance, method);
+bool close_code_write(CodeWriteWindow *window) {
+    __builtin___clear_cache(reinterpret_cast<char *>(window->begin),
+                            reinterpret_cast<char *>(window->end));
+    const bool restored = mprotect(reinterpret_cast<void *>(window->page_begin),
+                                   window->page_size, window->protection) == 0;
+    if (!restored)
+        LT_LOGW("Language getter original page protection not restored begin=%p errno=%d",
+                reinterpret_cast<void *>(window->begin), errno);
+    // The bytes are live even if the original protection could not be restored;
+    // report success so the owned ledger and synthetic check stay truthful.
+    return true;
+}
+
+// Restores planned bytes during the synthetic-return rejection path.
+bool write_language_getter_words(void *target, const uint32_t *words, size_t width) {
+    CodeWriteWindow window;
+    if (!open_code_write(target, width, &window)) return false;
+    memcpy(target, words, width);
+    return close_code_write(&window);
+}
+
+// Only a planned direct patch reaches here. The owned ledger records exactly
+// these bytes; the pure plan helper is the same one exercised by the host test.
+bool write_language_getter_patch(void *target, const limbus_language::Plan &plan) {
+    if (plan.strategy != limbus_language::Strategy::kDirect) return false;
+    CodeWriteWindow window;
+    if (!open_code_write(target, plan.width, &window)) return false;
+    limbus_language::apply_direct_plan(target, plan);
+    return close_code_write(&window);
+}
+
+void format_words(const uint32_t *words, size_t count, char *out, size_t size) {
+    out[0] = 0;
+    size_t used = 0;
+    for (size_t i = 0; i < count && used + 10 < size; ++i) {
+        int written = snprintf(out + used, size - used, i == 0 ? "%08x" : ".%08x", words[i]);
+        if (written <= 0) break;
+        used += static_cast<size_t>(written);
     }
-    return 2;  // LOCALIZE_LANGUAGE.JP
+}
+
+limbus_language::Strategy install_language_getter(
+        const char *label, void *target, uintptr_t next_method, const char *next_name) {
+#if !defined(__aarch64__)
+    // The direct patch is AArch64 machine code. Current builds are arm64-v8a
+    // only; if this file is ever compiled for another ABI, refuse instead of
+    // writing A64 instructions into a non-A64 process.
+    LT_LOGW("Language getter direct patch requires AArch64 label=%s target=%p; skip",
+            label, target);
+    return limbus_language::Strategy::kReject;
+#else
+    if (target == nullptr || next_method == 0) {
+        LT_LOGW("Language getter rejected label=%s target=%p next=%p reason=missing_boundary",
+                label, target, reinterpret_cast<void *>(next_method));
+        return limbus_language::Strategy::kReject;
+    }
+    uint32_t first_word = 0;
+    memcpy(&first_word, target, sizeof(first_word));
+    const limbus_language::Plan plan = limbus_language::plan_language_getter_patch(
+            reinterpret_cast<uintptr_t>(target), next_method, first_word);
+    const size_t distance = next_method - reinterpret_cast<uintptr_t>(target);
+    if (plan.strategy == limbus_language::Strategy::kReject) {
+        LT_LOGW("Language getter rejected label=%s target=%p next=%p next_name=%s distance=%zu"
+                " first=%08x reason=no_safe_width", label, target,
+                reinterpret_cast<void *>(next_method), next_name, distance, first_word);
+        return plan.strategy;
+    }
+
+    uint32_t before[5] = {};
+    memcpy(before, target, plan.width);
+    char before_text[5 * 10] = {};
+    format_words(before, plan.width / sizeof(uint32_t), before_text, sizeof(before_text));
+
+    LimbusOwnedCodePatch owned(target, plan.width);
+    const bool wrote = write_language_getter_patch(target, plan);
+    bool installed = wrote;
+    const char *status = wrote ? "installed" : "write_failed";
+    int32_t observed = -1;
+    if (wrote) {
+        uint32_t live[3] = {};
+        memcpy(live, target, plan.width);
+        if (memcmp(live, plan.words, plan.width) != 0) {
+            LT_LOGW("Language getter patch did not persist label=%s target=%p", label, target);
+            status = "write_not_persisted";
+            installed = false;
+        } else {
+            // Confirm the exact constant-return code path on the patched getter.
+            // This is a synthetic invocation, not a game hit.
+            typedef int32_t (*language_getter_fn)(void *, const void *);
+            observed = reinterpret_cast<language_getter_fn>(target)(nullptr, nullptr);
+            if (observed != 2) {
+                LT_LOGW("Language getter synthetic return mismatch label=%s target=%p observed=%d",
+                        label, target, observed);
+                const bool rolled_back =
+                        write_language_getter_words(target, before, plan.width);
+                status = rolled_back ? "rolled_back" : "rollback_failed";
+                if (!rolled_back)
+                    LT_LOGW("Language getter rollback failed label=%s target=%p", label, target);
+                installed = false;
+            }
+        }
+    }
+
+    // Always report the bytes actually live at the target after the attempt.
+    uint32_t after[5] = {};
+    memcpy(after, target, plan.width);
+    char after_text[5 * 10] = {};
+    format_words(after, plan.width / sizeof(uint32_t), after_text, sizeof(after_text));
+    LT_LOGI("Language getter label=%s target=%p next=%p next_name=%s distance=%zu"
+            " strategy=direct width=%zu replacement=none status=%s installed=%d"
+            " verification=synthetic_call observed=%d before=%s after=%s",
+            label, target, reinterpret_cast<void *>(next_method), next_name, distance,
+            plan.width, status, installed, observed, before_text, after_text);
+    return installed ? plan.strategy : limbus_language::Strategy::kReject;
+#endif
 }
 
 bool read_exact(FILE *file, void *buffer, size_t size) {
@@ -2923,6 +3050,8 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
     typedef uint32_t (*method_get_flags_fn)(const void *, uint32_t *);
     typedef const void *(*method_get_param_fn)(const void *, uint32_t);
     typedef const void *(*method_get_return_type_fn)(const void *);
+    typedef void *(*class_from_type_fn)(const void *);
+    typedef bool (*class_is_enum_fn)(void *);
     typedef char *(*type_get_name_fn)(const void *);
     typedef void (*il2cpp_free_fn)(void *);
 
@@ -2955,6 +3084,10 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
             resolver.resolve<method_get_param_fn>("il2cpp_method_get_param");
     method_get_return_type_fn method_get_return_type =
             resolver.resolve<method_get_return_type_fn>("il2cpp_method_get_return_type");
+    class_from_type_fn class_from_type =
+            resolver.resolve<class_from_type_fn>("il2cpp_class_from_type");
+    class_is_enum_fn class_is_enum =
+            resolver.resolve<class_is_enum_fn>("il2cpp_class_is_enum");
     type_get_name_fn type_get_name = resolver.resolve<type_get_name_fn>("il2cpp_type_get_name");
     il2cpp_free_fn il2cpp_free = resolver.resolve<il2cpp_free_fn>("il2cpp_free");
     string_length_fn string_length = resolver.resolve<string_length_fn>("il2cpp_string_length");
@@ -3024,6 +3157,8 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
     void *rpg_format_class = nullptr;
     const void *get_language_method = nullptr;
     const void *get_global_language_method = nullptr;
+    void *get_language_class = nullptr;
+    void *get_global_language_class = nullptr;
     struct AcquisitionTarget {
         std::string name;
         void *klass;
@@ -3127,13 +3262,21 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
         if (get_language_method == nullptr) {
             void *klass = class_from_name(image, "LocalSave", "LocalGameOptionData");
             if (klass != nullptr) {
-                get_language_method = class_get_method_from_name(klass, "GetLanguage", 0);
+                const void *method = class_get_method_from_name(klass, "GetLanguage", 0);
+                if (method != nullptr) {
+                    get_language_class = klass;
+                    get_language_method = method;
+                }
             }
         }
         if (get_global_language_method == nullptr) {
             void *klass = class_from_name(image, "", "GlobalGameManager");
             if (klass != nullptr) {
-                get_global_language_method = class_get_method_from_name(klass, "get_Lang", 0);
+                const void *method = class_get_method_from_name(klass, "get_Lang", 0);
+                if (method != nullptr) {
+                    get_global_language_class = klass;
+                    get_global_language_method = method;
+                }
             }
         }
     }
@@ -3511,6 +3654,58 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
                     position + 1 != managed_method_addresses.end() &&
                     *(position + 1) - address >= ((address & 7u) ? 20u : 16u);
         };
+        auto next_managed_method = [&](uintptr_t address, uintptr_t *next) {
+            auto position = std::lower_bound(managed_method_addresses.begin(),
+                                             managed_method_addresses.end(), address);
+            if (position == managed_method_addresses.end() || *position != address ||
+                position + 1 == managed_method_addresses.end()) return false;
+            *next = *(position + 1);
+            return true;
+        };
+        auto describe_managed_method = [&](void *klass, uintptr_t wanted, char *out, size_t size) {
+            if (out == nullptr || size == 0) return false;
+            out[0] = 0;
+            if (klass == nullptr || class_get_methods == nullptr || class_get_name == nullptr ||
+                method_get_name == nullptr) return false;
+            // The next method is usually the adjacent getter in the same class.
+            // If it belongs to another class, leave the diagnostic name unknown
+            // instead of rescanning every assembly/class/method for one log line.
+            void *iterator = nullptr;
+            const void *method = nullptr;
+            while ((method = class_get_methods(klass, &iterator)) != nullptr) {
+                void *address = nullptr;
+                memcpy(&address, method, sizeof(address));
+                if (reinterpret_cast<uintptr_t>(address) != wanted) continue;
+                snprintf(out, size, "%s::%s", class_get_name(klass),
+                         method_get_name(method) ? method_get_name(method) : "?");
+                return true;
+            }
+            return false;
+        };
+        auto language_getter_valid = [&](const void *method, const char *expected_name) {
+            if (method == nullptr || expected_name == nullptr || method_get_name == nullptr ||
+                method_get_flags == nullptr || method_get_return_type == nullptr ||
+                method_get_param_count == nullptr || type_get_name == nullptr ||
+                il2cpp_free == nullptr) return false;
+            const char *name = method_get_name(method);
+            if (name == nullptr || strcmp(name, expected_name) != 0 ||
+                method_get_param_count(method) != 0) return false;
+            uint32_t flags = 0;
+            method_get_flags(method, &flags);
+            if ((flags & 0x0010u) != 0) return false;  // instance getter only
+            const void *return_type = method_get_return_type(method);
+            void *return_class = class_from_type != nullptr && return_type != nullptr ?
+                    class_from_type(return_type) : nullptr;
+            const bool enum_return = return_class != nullptr && class_is_enum != nullptr &&
+                    class_is_enum(return_class);
+            if (enum_return) return true;
+            char *return_name = return_type != nullptr ? type_get_name(return_type) : nullptr;
+            const bool int_return = return_name != nullptr && strcmp(return_name, "System.Int32") == 0;
+            if (return_name != nullptr) il2cpp_free(return_name);
+            return int_return;
+        };
+        bool local_language_direct = false;
+        bool global_language_direct = false;
         const void *announcer_set = find_method_by_signature(announcer_ui_class, "SetDescription", "System.String");
         if (announcer_set && method_get_flags && method_get_return_type && class_get_fields &&
             field_get_name && field_get_type && field_get_value && g_object_get_instance_id_info) {
@@ -3713,14 +3908,36 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
                            reinterpret_cast<void *>(replacement_tmp_set_text_string),
                            reinterpret_cast<void **>(&g_original_tmp_set_text_string));
         }
-        if (get_language_pointer != nullptr) {
-            hook_limbus_owned_function(get_language_pointer,
-                           reinterpret_cast<void *>(replacement_get_language),
-                           reinterpret_cast<void **>(&g_original_get_language));
-        }
-        hook_limbus_owned_function(get_global_language_pointer,
-                       reinterpret_cast<void *>(replacement_global_get_language),
-                       reinterpret_cast<void **>(&g_original_global_get_language));
+        auto install_language = [&](const char *label, const char *expected_name, void *klass,
+                                    const void *method_info, void *pointer, bool *direct) {
+            *direct = false;
+            if (method_info == nullptr || pointer == nullptr) {
+                LT_LOGW("Language getter missing label=%s method=%p target=%p",
+                        label, method_info, pointer);
+                return;
+            }
+            if (!language_getter_valid(method_info, expected_name)) {
+                LT_LOGW("Language getter rejected label=%s target=%p reason=abi_or_identity",
+                        label, pointer);
+                return;
+            }
+            uintptr_t next = 0;
+            if (!next_managed_method(reinterpret_cast<uintptr_t>(pointer), &next)) {
+                LT_LOGW("Language getter rejected label=%s target=%p"
+                        " reason=no_next_managed_method", label, pointer);
+                return;
+            }
+            char next_name[192] = "unknown";
+            describe_managed_method(klass, next, next_name, sizeof(next_name));
+            *direct = install_language_getter(label, pointer, next, next_name) ==
+                    limbus_language::Strategy::kDirect;
+        };
+        install_language("LocalSave.LocalGameOptionData.GetLanguage", "GetLanguage",
+                         get_language_class, get_language_method, get_language_pointer,
+                         &local_language_direct);
+        install_language("GlobalGameManager.get_Lang", "get_Lang",
+                         get_global_language_class, get_global_language_method,
+                         get_global_language_pointer, &global_language_direct);
         size_t acquisition_counts[] = {0, 0, 0};
         std::unordered_set<void *> acquisition_pointers;
         bool acquisition_ready = class_get_methods != nullptr && method_get_name != nullptr &&
@@ -3811,10 +4028,9 @@ bool report_il2cpp_resolver(const MappedElfResolver &resolver, bool query_domain
                 set_text_string_pointer, reinterpret_cast<void *>(g_original_tmp_set_text_string));
         LT_LOGI("UI.Text translation hook setter=%p/%p",
                 ui_pointer, reinterpret_cast<void *>(g_original_ui_set_text));
-        LT_LOGI("Japanese language hooks installed option=%p/%p global=%p/%p",
-                get_language_pointer, reinterpret_cast<void *>(g_original_get_language),
-                get_global_language_pointer,
-                reinterpret_cast<void *>(g_original_global_get_language));
+        LT_LOGI("Japanese language getters configured option=%p global=%p direct=%d/%d",
+                get_language_pointer, get_global_language_pointer,
+                local_language_direct, global_language_direct);
         LT_LOGI("Text acquisition hooks installed argc0=%zu argc1=%zu argc2=%zu ready=%d",
                 acquisition_counts[0], acquisition_counts[1], acquisition_counts[2],
                 acquisition_ready);
